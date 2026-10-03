@@ -490,7 +490,10 @@ def test_docker_egress_node_options_uses_sentinel(hermes_home, monkeypatch):
     monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
 
-    _, env, _ = _egress_proxy_args_for_docker()
+    _, env, tokens, _ = _egress_proxy_args_for_docker()
+    assert tokens["OPENROUTER_API_KEY"] == mapping.proxy_token
+    assert tokens["HERMES_PROXY_TOKEN_OPENROUTER_API_KEY"] == mapping.proxy_token
+    assert not (set(env) & set(tokens)), "Token values must stay out of static settings"
     # The egress dict should contain the sentinel, NOT a raw NODE_OPTIONS.
     assert env.get("_HERMES_EGRESS_NODE_OPTIONS_APPEND") == "--use-openssl-ca"
     assert "NODE_OPTIONS" not in env, (

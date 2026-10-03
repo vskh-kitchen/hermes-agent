@@ -521,6 +521,11 @@ def _name_only_env_args(names) -> list[str]:
     return [arg for key in sorted(names) for arg in ("-e", key)]
 
 
+def _literal_env_args(values: dict[str, str]) -> list[str]:
+    """Static, non-secret settings belong to the container, not the client env."""
+    return [arg for key, value in sorted(values.items()) for arg in ("-e", f"{key}={value}")]
+
+
 # Mount kinds declared by skills/credential_files: (getter, expects_file, log noun).
 _RO_MOUNT_SOURCES = (
     ("get_credential_file_mounts", True, "credential"),
@@ -758,11 +763,11 @@ class DockerEnvironment(BaseEnvironment):
     def _egress_and_env_args(self, extra_args) -> tuple[str, list[str], list[str], list[str], list[str]]:
         """Egress credential-injection proxy plumbing (CA mount + HTTPS_PROXY/CA-bundle env so
         outbound traffic routes through the host-side proxy and the sandbox receives proxy tokens
-        instead of real API keys), merged with docker_env into name-only ``-e`` args, plus the
-        validated docker_extra_args. Returns ``(egress_label, volume_args, host_args, env_args,
-        validated_extra)``; sets ``self._run_env_values`` (injected into the docker-client
-        subprocess env at run time and reused verbatim by container-recreation recovery)."""
-        egress_volume_args, egress_env_overrides, egress_host_args = _egress_proxy_args_for_docker()
+        instead of real API keys). Static settings use literal ``-e KEY=value``; only tokens
+        use name-only flags plus the client environment. Returns ``(egress_label, volume_args,
+        host_args, env_args, validated_extra)``; saves token values for creation and recovery."""
+        egress_volume_args, egress_settings, egress_tokens, egress_host_args = _egress_proxy_args_for_docker()
+        egress_env_overrides = {**egress_settings, **egress_tokens}
         egress_label = _egress_reuse_fingerprint(egress_volume_args, egress_env_overrides, egress_host_args)
         enforce_egress = _egress_enforce_on_docker() if egress_env_overrides else True
         critical_egress_names = _critical_egress_env_names(egress_env_overrides)
@@ -771,7 +776,9 @@ class DockerEnvironment(BaseEnvironment):
             check_docker_env_collisions(self._env, egress_env_overrides, enforce_egress)
 
         merged_env = merge_egress_env(self._env, egress_env_overrides, enforce_egress)
-        self._run_env_values = dict(merged_env)
+        self._run_env_values = {key: value for key, value in merged_env.items() if key in egress_tokens}
+        settings = {key: value for key, value in merged_env.items() if key not in egress_tokens}
+        env_args = _literal_env_args(settings) + _name_only_env_args(self._run_env_values)
 
         validated_extra = []
         for arg in (extra_args or []):
@@ -781,7 +788,7 @@ class DockerEnvironment(BaseEnvironment):
             validated_extra.append(arg)
         if egress_env_overrides:
             check_extra_args_collisions(validated_extra, critical_egress_names, enforce_egress)
-        return egress_label, egress_volume_args, egress_host_args, _name_only_env_args(merged_env), validated_extra
+        return egress_label, egress_volume_args, egress_host_args, env_args, validated_extra
 
     def _resource_args(self, image, cpu, memory, disk, network, shm_size, extra_args) -> list[str]:
         """cgroup-gated CPU/memory/pids limits, shm size, disk quota and network mode."""
@@ -1041,19 +1048,13 @@ class DockerEnvironment(BaseEnvironment):
         return client_env_with(values)
 
     def _build_init_env_args(self) -> list[str]:
-        """Name-only ``-e`` args for init_session so ``export -p`` captures docker_env
-        plus the current profile's forwarded values (values travel via the client env).
-
-        The VALUES intentionally do not appear in the argv — they are passed via the docker client
-        subprocess env (see _docker_client_env and issue #96268); the flags here are name-only ``-e KEY``.
-        """
+        """Seed static settings without changing the client; forwarded secrets stay off argv."""
         passthrough_env, unset_names = self._resolve_passthrough_env()
-        exec_env = {**self._env, **passthrough_env}
-        for name in unset_names:
-            exec_env.pop(name, None)
+        settings = {key: value for key, value in self._env.items()
+                    if key not in passthrough_env and key not in unset_names}
         self._init_unset_passthrough_names = tuple(sorted(unset_names))
-        self._init_env_values = dict(exec_env)
-        return _name_only_env_args(exec_env)
+        self._init_env_values = dict(passthrough_env)
+        return _literal_env_args(settings) + _name_only_env_args(passthrough_env)
 
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """See ``remote_common.resolve_passthrough_env``; explicit docker_forward_env bypasses the blocklist."""
@@ -1081,8 +1082,8 @@ class DockerEnvironment(BaseEnvironment):
 
         # Init seeds the snapshot. Profile-scoped passthrough values are also injected on every later
         # command because this container can be shared by multiple routed profiles in one gateway process.
-        # Env flags are name-only; values travel via the client subprocess env so they never hit
-        # world-readable /proc/*/cmdline (#96268).
+        # Only static settings use literal flags. Forwarded secrets travel via the client
+        # subprocess env so they never hit world-readable /proc/*/cmdline (#96268).
         unset_names: tuple[str, ...] = ()
         env_values: dict[str, str] = {}
         if login:

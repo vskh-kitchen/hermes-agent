@@ -26,8 +26,8 @@ _PROXY_CONTROL_ENV = frozenset({
     "NODE_EXTRA_CA_CERTS"})
 
 
-def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str]]:
-    """``(volume_args, env_overrides, host_args)`` for routing through iron-proxy; all empty
+def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], dict[str, str], list[str]]:
+    """``(volume_args, settings, tokens, host_args)`` for routing through iron-proxy; all empty
     when the proxy is disabled/unconfigured/not running. Under ``proxy.enforce_on_docker``
     (default) any half-configured state raises so the sandbox refuses to start unprotected;
     otherwise it warns and continues. Only ImportError is swallowed — a broken config must
@@ -37,11 +37,11 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
         from agent.proxy_sources import iron_proxy as ip
     except ImportError as exc:
         logger.debug("Egress proxy plumbing unavailable: %s", exc)
-        return ([], {}, [])
+        return ([], {}, {}, [])
 
     proxy_cfg = load_config().get("proxy") or {}
     if not proxy_cfg.get("enabled"):
-        return ([], {}, [])
+        return ([], {}, {}, [])
 
     status = ip.get_status()
     enforce = bool(proxy_cfg.get("enforce_on_docker", True))
@@ -50,7 +50,7 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
         if enforce:
             raise RuntimeError(msg)
         logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
-        return ([], {}, [])
+        return ([], {}, {}, [])
 
     if not status.configured:
         return _degraded(
@@ -102,15 +102,17 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
 
     # Proxy tokens under the standard provider env names (and their aliases) so
     # SDKs work unchanged; HERMES_PROXY_TOKEN_* copies are for diagnostics.
+    # Preserve their provenance: these values must not become CLI arguments.
+    tokens: dict[str, str] = {}
     for m in mappings:
-        env_overrides[m.real_env_name] = m.proxy_token
-        env_overrides[f"HERMES_PROXY_TOKEN_{m.real_env_name}"] = m.proxy_token
+        tokens[m.real_env_name] = m.proxy_token
+        tokens[f"HERMES_PROXY_TOKEN_{m.real_env_name}"] = m.proxy_token
         for alias in getattr(m, "alias_env_names", ()) or ():
-            env_overrides[alias] = m.proxy_token
+            tokens[alias] = m.proxy_token
 
     # Linux needs an explicit host-gateway mapping; Docker Desktop already has it.
     host_args = ["--add-host", "host.docker.internal:host-gateway"]
-    return (volume_args, env_overrides, host_args)
+    return (volume_args, env_overrides, tokens, host_args)
 
 
 def _egress_reuse_fingerprint(

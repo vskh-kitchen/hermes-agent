@@ -395,6 +395,24 @@ terminal:
 
 **`docker_env`** vs **`docker_forward_env`**: the former injects literal `KEY=value` pairs you specify in the config (the values live in your `config.yaml` or are passed as a JSON dict via `TERMINAL_DOCKER_ENV='{"DEBUG":"1"}'`). The latter forwards values from your shell or `~/.hermes/.env`, so the actual secret never appears in the config file. Use `docker_forward_env` for tokens and `docker_env` for static knobs the container needs.
 
+**Transport and migration:** `docker_env` is for **non-secret settings**. These values
+are passed as literal `-e NAME=value` arguments, so an inner `DOCKER_HOST`, `HOME`, or
+proxy setting does not reconfigure the outer Docker/Podman client. They can be visible
+in process listings, diagnostic logs, and exception messages. If you previously stored
+credentials in `docker_env`, move them to your shell or profile `.env` and list their
+names in `docker_forward_env` before using this transport. Hermes does not infer
+sensitivity from variable names or value patterns.
+
+Forwarded credentials (including profile-scoped passthrough) and generated egress
+tokens retain name-only `-e NAME` forwarding; their values travel in the client
+subprocess environment, not its arguments. Static egress proxy settings use literal
+arguments. Both paths preserve multiline values without temporary env files.
+This protects secrets from argv exposure, not from the runtime administrator or
+container processes. It is also **not arbitrary client-environment isolation**:
+forwarding a client-control variable through the sensitive path can still change
+the outer client's behavior. Use `docker_env` for non-secret container-only settings;
+this backend does not provide a separate secret transport for client-control values.
+
 **`terminal.docker_extra_args`** (also overridable via `TERMINAL_DOCKER_EXTRA_ARGS='["--gpus=all"]'`) lets you pass arbitrary `docker run` flags that Hermes doesn't surface as first-class keys — `--gpus`, `--network`, `--add-host`, alternative `--security-opt` overrides, etc. Each entry must be a string; the list is appended last to the assembled `docker run` invocation so it can override Hermes' defaults if needed. Use sparingly — flags that conflict with the sandbox hardening (capability drops, `--user`, the workspace bind mount) will silently weaken isolation.
 
 **`terminal.docker_network`** (default `true`; env: `TERMINAL_DOCKER_NETWORK`) — set to `false` to run the sandbox container with `--network=none`, cutting off all network egress from agent commands. This applies to the execution container used by `terminal`, `execute_code`, and the file tools. Because containers persist across Hermes processes, flipping this to `false` while an older networked container exists will remove that container and start a fresh air-gapped one (a warning is logged); background processes running inside it are lost. Prefer this key over passing `--network=none` through `docker_extra_args`.

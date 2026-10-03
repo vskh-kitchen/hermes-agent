@@ -323,8 +323,33 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
 # ── docker_env tests ──────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("setting", ["DOCKER_HOST", "CONTAINER_HOST", "HTTP_PROXY", "HOME"])
+def test_static_settings_do_not_change_outer_client_on_run_init_or_recovery(monkeypatch, setting):
+    """Container-only settings must not reconfigure the CLI that starts/execs it."""
+    monkeypatch.setenv(setting, "outer-value")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+    env = _make_dummy_env(env={setting: "inner-value\nwith='literal'"})
+    monkeypatch.setattr(
+        docker_env, "_popen_bash",
+        lambda cmd, stdin_data=None, **kw: calls.append((cmd, kw)) or object(),
+    )
+    env._run_bash("true", login=True)
+    assert env._recreate_container()
+    # Exercise the login arguments again after recreation.
+    env._run_bash("true", login=True)
+    invocations = [(cmd, kw) for cmd, kw in calls if cmd[1] in ("run", "exec")]
+    assert {cmd[1] for cmd, _ in invocations} == {"run", "exec"}
+    for cmd, kw in invocations:
+        assert (kw.get("env") or os.environ)[setting] == "outer-value"
+        assert f"{setting}=inner-value\nwith='literal'" in cmd
+    assert os.environ[setting] == "outer-value"
+
+
 def test_docker_env_appears_in_run_command(monkeypatch):
-    """Explicit docker_env values pass via name-only -e + client env (#96268)."""
+    """Literal settings configure the container without changing the outer CLI."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
 
@@ -333,22 +358,18 @@ def test_docker_env_appears_in_run_command(monkeypatch):
     run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert run_calls, "docker run should have been called"
     run_args, run_kwargs = run_calls[0]
-    run_args_str = " ".join(run_args)
-    # Names in argv, values ONLY in the client subprocess env (#96268).
-    assert "SSH_AUTH_SOCK" in run_args and "GNUPGHOME" in run_args
-    assert "/run/user/1000/ssh-agent.sock" not in run_args_str
-    assert "/root/.gnupg" not in run_args_str
-    client_env = run_kwargs.get("env") or {}
-    assert client_env.get("SSH_AUTH_SOCK") == "/run/user/1000/ssh-agent.sock"
-    assert client_env.get("GNUPGHOME") == "/root/.gnupg"
+    assert "SSH_AUTH_SOCK=/run/user/1000/ssh-agent.sock" in run_args
+    assert "GNUPGHOME=/root/.gnupg" in run_args
+    assert run_kwargs.get("env") is None  # inherit the unmodified client environment
 
 
 def _node_options_from_run(calls):
     run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert run_calls, "docker run should have been called"
-    args, kwargs = run_calls[0]
-    if "NODE_OPTIONS" in args and "-e" in args:
-        return (kwargs.get("env") or {}).get("NODE_OPTIONS")
+    args, _ = run_calls[0]
+    for arg in args:
+        if arg.startswith("NODE_OPTIONS="):
+            return arg.split("=", 1)[1]
     return None
 
 
@@ -359,7 +380,7 @@ def test_egress_node_options_overrides_conflicting_ca_flag(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(
         docker_env, "_egress_proxy_args_for_docker",
-        lambda: ([], {"_HERMES_EGRESS_NODE_OPTIONS_APPEND": "--use-openssl-ca"}, []),
+        lambda: ([], {"_HERMES_EGRESS_NODE_OPTIONS_APPEND": "--use-openssl-ca"}, {}, []),
     )
     calls = _mock_subprocess_run(monkeypatch)
 
@@ -986,6 +1007,7 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
         lambda: (
             ["-v", "/tmp/ca:/etc/ssl/certs/hermes-egress-ca.crt:ro"],
             {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            {},
             ["--add-host", "host.docker.internal:host-gateway"],
         ),
     )
@@ -1081,6 +1103,7 @@ def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
         lambda: (
             [],
             {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            {},
             [],
         ),
     )
@@ -1099,7 +1122,7 @@ def test_extra_args_non_suffixed_egress_name_refuses_under_egress(monkeypatch):
     monkeypatch.setattr(
         docker_env,
         "_egress_proxy_args_for_docker",
-        lambda: ([], {"AWS_SECRET_ACCESS_KEY": "proxy-token"}, []),
+        lambda: ([], {}, {"AWS_SECRET_ACCESS_KEY": "proxy-token"}, []),
     )
     _mock_subprocess_run(monkeypatch)
 
@@ -1114,7 +1137,7 @@ def test_forward_env_non_suffixed_egress_name_refuses_under_egress(monkeypatch):
     monkeypatch.setattr(
         docker_env,
         "_egress_proxy_args_for_docker",
-        lambda: ([], {"AWS_SECRET_ACCESS_KEY": "proxy-token"}, []),
+        lambda: ([], {}, {"AWS_SECRET_ACCESS_KEY": "proxy-token"}, []),
     )
     _mock_subprocess_run(monkeypatch)
 
@@ -1155,7 +1178,7 @@ def test_extra_args_joined_shorthand_refuses_under_egress(monkeypatch):
     monkeypatch.setattr(
         docker_env,
         "_egress_proxy_args_for_docker",
-        lambda: ([], {"HTTPS_PROXY": "http://host.docker.internal:9090"}, []),
+        lambda: ([], {"HTTPS_PROXY": "http://host.docker.internal:9090"}, {}, []),
     )
     _mock_subprocess_run(monkeypatch)
 
@@ -1875,20 +1898,30 @@ def test_forwarded_secret_values_never_in_argv(monkeypatch):
     assert (kw.get("env") or {}).get("GITLAB_TOKEN") == secret
 
 
-def test_docker_run_secret_values_never_in_argv(monkeypatch):
-    """Regression #96268 for the `docker run -d` container-start path."""
-    secret = "run-time-secret-value"
+@pytest.mark.parametrize("name", ["MY_TOKEN", "ARBITRARY_CREDENTIAL_NAME"])
+def test_docker_run_secret_values_never_in_argv(monkeypatch, name):
+    """Generated tokens remain private, regardless of naming, including on recovery."""
+    secret = "run-time-secret\nwith='literal'\n"
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+    monkeypatch.setenv("HTTPS_PROXY", "http://outer-proxy:1234")
+    monkeypatch.setattr(
+        docker_env, "_egress_proxy_args_for_docker",
+        lambda: ([], {"HTTPS_PROXY": "http://inner-proxy:9090"}, {name: secret}, []),
+    )
     calls = _mock_subprocess_run(monkeypatch)
 
-    _make_dummy_env(env={"MY_TOKEN": secret})
+    env = _make_dummy_env()
+    assert env._recreate_container()
 
     run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
-    assert run_calls, "docker run should have been called"
-    args, kwargs = run_calls[0]
-    assert "MY_TOKEN" in args
-    assert all(secret not in str(a) for a in args)
-    assert (kwargs.get("env") or {}).get("MY_TOKEN") == secret
+    assert len(run_calls) == 2
+    for args, kwargs in run_calls:
+        assert name in args
+        assert all(secret not in str(a) for a in args)
+        assert kwargs["env"][name] == secret
+        assert kwargs["env"]["HTTPS_PROXY"] == "http://outer-proxy:1234"
+        assert "HTTPS_PROXY=http://inner-proxy:9090" in args
 
 
 def test_docker_env_warnings_never_echo_values(caplog):
