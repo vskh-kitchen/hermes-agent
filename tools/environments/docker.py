@@ -28,6 +28,7 @@ from tools.terminal_tool_config import (
     _host_path_key, _is_windows_drive_path, cwd_follows_host_mount,
 )
 from tools.environments.base_output import _popen_bash
+from tools.environments.docker_env_transport import DockerEnvTransport, name_only_env_args
 from tools.environments.docker_egress import (
     _EGRESS_LABEL_KEY, _critical_egress_env_names, _egress_enforce_on_docker, _egress_proxy_args_for_docker,
     _egress_reuse_fingerprint, check_docker_env_collisions, check_extra_args_collisions,
@@ -35,7 +36,7 @@ from tools.environments.docker_egress import (
 )
 from tools.environments.path_utils import sanitize_task_id_for_path
 from tools.environments.remote_common import (
-    bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
+    bash_argv, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
 
 logger = logging.getLogger(__name__)
 
@@ -515,12 +516,6 @@ def _ensure_docker_available() -> None:
                  "or run `hermes setup terminal` to switch to Local.")
 
 
-def _name_only_env_args(names) -> list[str]:
-    """``-e KEY`` flags (no values): the docker CLI resolves values from its own env,
-    so secrets live in owner-readable /proc/*/environ instead of world-readable cmdline."""
-    return [arg for key in sorted(names) for arg in ("-e", key)]
-
-
 # Mount kinds declared by skills/credential_files: (getter, expects_file, log noun).
 _RO_MOUNT_SOURCES = (
     ("get_credential_file_mounts", True, "credential"),
@@ -758,10 +753,10 @@ class DockerEnvironment(BaseEnvironment):
     def _egress_and_env_args(self, extra_args) -> tuple[str, list[str], list[str], list[str], list[str]]:
         """Egress credential-injection proxy plumbing (CA mount + HTTPS_PROXY/CA-bundle env so
         outbound traffic routes through the host-side proxy and the sandbox receives proxy tokens
-        instead of real API keys), merged with docker_env into name-only ``-e`` args, plus the
+        instead of real API keys), merged with docker_env into forwarding args, plus the
         validated docker_extra_args. Returns ``(egress_label, volume_args, host_args, env_args,
-        validated_extra)``; sets ``self._run_env_values`` (injected into the docker-client
-        subprocess env at run time and reused verbatim by container-recreation recovery)."""
+        validated_extra)``; sets ``self._run_env_values`` (transported at run time
+        without reconfiguring the client, and reused by container-recreation recovery)."""
         egress_volume_args, egress_env_overrides, egress_host_args = _egress_proxy_args_for_docker()
         egress_label = _egress_reuse_fingerprint(egress_volume_args, egress_env_overrides, egress_host_args)
         enforce_egress = _egress_enforce_on_docker() if egress_env_overrides else True
@@ -781,7 +776,7 @@ class DockerEnvironment(BaseEnvironment):
             validated_extra.append(arg)
         if egress_env_overrides:
             check_extra_args_collisions(validated_extra, critical_egress_names, enforce_egress)
-        return egress_label, egress_volume_args, egress_host_args, _name_only_env_args(merged_env), validated_extra
+        return egress_label, egress_volume_args, egress_host_args, name_only_env_args(merged_env), validated_extra
 
     def _resource_args(self, image, cpu, memory, disk, network, shm_size, extra_args) -> list[str]:
         """cgroup-gated CPU/memory/pids limits, shm size, disk quota and network mode."""
@@ -1015,9 +1010,11 @@ class DockerEnvironment(BaseEnvironment):
         run_cmd = self._run_command(container_name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         try:
-            result = run_capture(
-                run_cmd, timeout=120, check=True,  # image pull may take a while
-                env=self._docker_client_env(self._run_env_values))
+            with DockerEnvTransport(self._run_env_values) as transport:
+                run_cmd[2:2] = transport.args
+                result = run_capture(
+                    run_cmd, timeout=120, check=True,  # image pull may take a while
+                    env=transport.client_env)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning("docker run failed for %s, cleaning up orphaned container: %s", container_name, e)
             subprocess.run(
@@ -1029,23 +1026,11 @@ class DockerEnvironment(BaseEnvironment):
         return container_id
 
     # --- Env forwarding ---
-    def _docker_client_env(self, values: dict[str, str]) -> dict[str, str] | None:
-        """Env for the docker-client subprocess carrying forwarded values (pairs with name-only
-        ``-e KEY`` flags to keep secrets out of cmdline); ``None`` = inherit when empty.
-
-        Name-only ``-e KEY`` flags make the docker CLI read each value from its own process environment,
-        keeping secrets out of the client's world-readable ``/proc/<pid>/cmdline`` (issue #96268). Values
-        live in ``/proc/<pid>/environ`` instead, which is owner/root-only. Returns ``None`` (inherit as
-        before) when there is nothing to add.
-        """
-        return client_env_with(values)
-
     def _build_init_env_args(self) -> list[str]:
-        """Name-only ``-e`` args for init_session so ``export -p`` captures docker_env
-        plus the current profile's forwarded values (values travel via the client env).
+        """Init forwarding so ``export -p`` captures docker_env and scoped values.
 
-        The VALUES intentionally do not appear in the argv — they are passed via the docker client
-        subprocess env (see _docker_client_env and issue #96268); the flags here are name-only ``-e KEY``.
+        Ordinary names use ``-e KEY``; client-control names get an env file at spawn.
+        Neither transport exposes values on argv (#96268).
         """
         passthrough_env, unset_names = self._resolve_passthrough_env()
         exec_env = {**self._env, **passthrough_env}
@@ -1053,20 +1038,19 @@ class DockerEnvironment(BaseEnvironment):
             exec_env.pop(name, None)
         self._init_unset_passthrough_names = tuple(sorted(unset_names))
         self._init_env_values = dict(exec_env)
-        return _name_only_env_args(exec_env)
+        return name_only_env_args(exec_env)
 
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """See ``remote_common.resolve_passthrough_env``; explicit docker_forward_env bypasses the blocklist."""
         return resolve_passthrough_env(self._forward_env, hermes_env_loader=_load_hermes_env_vars)
 
     def _build_runtime_env_args_with_unsets(self) -> tuple[list[str], tuple[str, ...], dict[str, str]]:
-        """Runtime name-only forwarding args, names absent from scope, and the values
-        to inject into the docker client subprocess env.
+        """Runtime name-only args, names absent from scope, and transport values.
 
         See #96268.
         """
         passthrough_env, unset_names = self._resolve_passthrough_env()
-        return _name_only_env_args(passthrough_env), tuple(sorted(unset_names)), dict(passthrough_env)
+        return name_only_env_args(passthrough_env), tuple(sorted(unset_names)), dict(passthrough_env)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
@@ -1081,8 +1065,8 @@ class DockerEnvironment(BaseEnvironment):
 
         # Init seeds the snapshot. Profile-scoped passthrough values are also injected on every later
         # command because this container can be shared by multiple routed profiles in one gateway process.
-        # Env flags are name-only; values travel via the client subprocess env so they never hit
-        # world-readable /proc/*/cmdline (#96268).
+        # Ordinary values travel via name-only flags; client-control values use a
+        # private env file so they cannot redirect the outer CLI. Neither uses argv values.
         unset_names: tuple[str, ...] = ()
         env_values: dict[str, str] = {}
         if login:
@@ -1094,8 +1078,13 @@ class DockerEnvironment(BaseEnvironment):
             cmd.extend(runtime_args)
         cmd += [self._container_id, *bash_argv(prepend_unset(cmd_string, unset_names), login)]
 
-        client_env = self._docker_client_env(env_values)
-        return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
+        with DockerEnvTransport(env_values) as transport:
+            cmd[2:2] = transport.args
+            client_env = transport.client_env
+            proc = (_popen_bash(cmd, stdin_data, env=client_env) if client_env is not None
+                    else _popen_bash(cmd, stdin_data))
+            transport.keep_until_exit(proc)
+            return proc
 
     # --- "No such container" recovery ---
     _NO_CONTAINER_PATTERNS = ("No such container", "is not running", "no such container")
@@ -1130,12 +1119,8 @@ class DockerEnvironment(BaseEnvironment):
                 logger.error("Recovery: no saved image name, cannot recreate container")
                 return False
             try:
-                new_name = f"hermes-{uuid.uuid4().hex[:8]}"
-                result = run_capture(
-                    self._run_command(new_name, self.cwd), timeout=120, check=True,
-                    env=self._docker_client_env(self._run_env_values))
-                self._container_id = result.stdout.strip()
-                logger.info("Recovery: created fresh container %s (%s)", new_name, self._container_id[:12])
+                self._container_id = self._docker_run(self.cwd)
+                logger.info("Recovery: created fresh container %s", self._container_id[:12])
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False

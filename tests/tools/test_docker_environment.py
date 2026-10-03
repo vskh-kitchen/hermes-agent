@@ -25,7 +25,12 @@ def _mock_subprocess_run(monkeypatch):
     calls = []
 
     def _run(cmd, **kwargs):
-        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        recorded = dict(kwargs)
+        if isinstance(cmd, list) and "--env-file" in cmd:
+            # The transport removes the private file when this invocation ends.
+            with open(cmd[cmd.index("--env-file") + 1], encoding="utf-8") as stream:
+                recorded["env_file_values"] = dict(line.rstrip("\n").split("=", 1) for line in stream)
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, recorded))
         if isinstance(cmd, list) and len(cmd) >= 2:
             if cmd[1] == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
@@ -324,7 +329,7 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
 
 
 def test_docker_env_appears_in_run_command(monkeypatch):
-    """Explicit docker_env values pass via name-only -e + client env (#96268)."""
+    """Container values arrive without appearing in the CLI's argv (#96268)."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
 
@@ -334,12 +339,14 @@ def test_docker_env_appears_in_run_command(monkeypatch):
     assert run_calls, "docker run should have been called"
     run_args, run_kwargs = run_calls[0]
     run_args_str = " ".join(run_args)
-    # Names in argv, values ONLY in the client subprocess env (#96268).
-    assert "SSH_AUTH_SOCK" in run_args and "GNUPGHOME" in run_args
+    # SSH_AUTH_SOCK could redirect the client's SSH helper, so it uses an env
+    # file; ordinary GNUPGHOME still uses a name-only flag and client env.
+    assert "GNUPGHOME" in run_args
     assert "/run/user/1000/ssh-agent.sock" not in run_args_str
     assert "/root/.gnupg" not in run_args_str
     client_env = run_kwargs.get("env") or {}
-    assert client_env.get("SSH_AUTH_SOCK") == "/run/user/1000/ssh-agent.sock"
+    assert run_kwargs["env_file_values"]["SSH_AUTH_SOCK"] == "/run/user/1000/ssh-agent.sock"
+    assert client_env.get("SSH_AUTH_SOCK") == os.environ.get("SSH_AUTH_SOCK")
     assert client_env.get("GNUPGHOME") == "/root/.gnupg"
 
 

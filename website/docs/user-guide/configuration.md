@@ -677,6 +677,32 @@ terminal:
 
 Hermes resolves each listed variable from your current shell first, then falls back to `~/.hermes/.env` if it was saved with `hermes config set`.
 
+`docker_env` and forwarded values configure the **container**, not the outer
+Docker/Podman client. For example, an inner `DOCKER_HOST` pointing at a mounted
+Podman socket does not change the endpoint Hermes uses to create, recreate, or
+exec into the sandbox. The outer client retains the environment of the Hermes
+process, including its endpoint, context, TLS, home directory, and proxy settings.
+
+Hermes keeps these values out of generated Docker command arguments. Ordinary
+variables use name-only `-e NAME` flags and support multiline secrets. Variables
+that can configure the outer client or its helpers instead use a temporary
+owner-only env file, removed after the client exits. These include `DOCKER_*`,
+`CONTAINER_*`, `CONTAINERS_*`, `PODMAN_*`, `BUILDKIT_*`, `XDG_*`, `SSH_*`,
+`SSL_*`, dynamic-loader variables, home/path/temp-directory settings, registry
+authentication and storage settings, D-Bus, HTTP proxy and CA-bundle settings,
+and Go runtime settings (names are matched without regard
+to case).
+
+**Env-file limitation:** those client-control variables cannot contain CR or LF;
+Hermes rejects them with an error naming the variable, never its value. Ordinary
+multiline secrets are unaffected. Env-file entries must also be valid UTF-8 and
+each encoded `NAME=value` line must be shorter than 64 KiB (the CLI parser limit).
+NUL is rejected in all values because operating
+systems cannot represent it in an environment variable. Set multiline client
+configuration inside the container through a mounted file or startup script
+instead. Custom Docker wrapper/helper programs that interpret additional
+application-specific variables are not covered by the client-control name list.
+
 :::warning
 Anything listed in `docker_forward_env` becomes visible to commands run inside the container. Only forward credentials you are comfortable exposing to the terminal session.
 :::
