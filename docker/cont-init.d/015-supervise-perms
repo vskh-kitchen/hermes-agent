@@ -1,4 +1,4 @@
-#!/command/with-contenv sh
+#!/command/with-contenv /bin/sh
 # shellcheck shell=sh
 # Make supervise/ trees for ALL declared s6 services queryable and
 # controllable by the unprivileged hermes user (UID 10000).
@@ -37,6 +37,8 @@
 # renumbering both (which would be a churn-noise patch on its own).
 
 set -eu
+
+. /opt/hermes/docker/runtime-env.sh
 
 # /run/s6-rc/servicedirs holds the live, compiled service directories
 # for every static (s6-rc) service. Symlinks under /run/service/*

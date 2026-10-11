@@ -51,7 +51,8 @@ fi
 
 # Already non-root? Just exec the real binary. This is the hot path for
 # supervised processes (uid 10000) and for `docker exec --user hermes`.
-if [ "$(id -u)" != "0" ]; then
+if [ "$(/usr/bin/id -u)" != "0" ]; then
+    . /opt/hermes/docker/runtime-env.sh
     exec "$REAL" "$@"
 fi
 
@@ -82,6 +83,6 @@ fi
 # this, $HOME stays /root and any library that resolves paths off $HOME
 # (XDG caches, lockfiles, .config writes) will try to write to /root and
 # fail with EACCES. Mirrors main-wrapper.sh.
-export HOME=/opt/data
+. /opt/hermes/docker/runtime-env.sh
 
-exec "$S6_SUID" hermes "$REAL" "$@"
+exec "$S6_SUID" hermes /usr/bin/env "PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:$HERMES_HOME/.local/bin:$PATH" "$REAL" "$@"

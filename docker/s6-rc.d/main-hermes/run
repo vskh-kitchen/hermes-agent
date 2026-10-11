@@ -1,4 +1,4 @@
-#!/command/with-contenv sh
+#!/command/with-contenv /bin/sh
 # shellcheck shell=sh
 # Main hermes service.
 #
@@ -24,4 +24,4 @@
 # The dashboard runs as a real s6 service alongside it (see
 # ../dashboard/run) and per-profile gateways register dynamically via
 # /run/service/ at runtime (Phase 4).
-exec sleep infinity
+exec /bin/sleep infinity

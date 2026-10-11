@@ -441,14 +441,19 @@ class S6ServiceManager:
         stack.
         """
         lines = [
-            "#!/command/with-contenv sh",
+            "#!/command/with-contenv /bin/sh",
             "# shellcheck shell=sh",
             "set -e",
-            "export HOME=/opt/data",
-            "cd /opt/data",
         ]
         for k, v in sorted(extra_env.items()):
             lines.append(f"export {k}={shlex.quote(v)}")
+        lines.append(". /opt/hermes/docker/runtime-env.sh")
+        # Preserve the existing explicit HOME override contract after the default
+        # reset. Other extra_env entries precede the helper so HERMES_HOME and
+        # explicit empty safety roots participate in runtime default resolution.
+        if "HOME" in extra_env:
+            lines.append(f"export HOME={shlex.quote(extra_env['HOME'])}")
+        lines.append('cd "$HERMES_HOME"')
         # Supervised-child sentinel: without it the supervised gateway re-entering
         # `_gateway_command_inner` with subcmd == "run" would dispatch `gateway start` → re-exec
         # `gateway run --replace` → `gateway start` … (see the matching guard there).
@@ -464,13 +469,15 @@ class S6ServiceManager:
         # confirmation + scoped-lock cleanup, see gateway/run.py) so s6 always wins; the sentinel
         # above prevents the run→start→run recursion. s6 guarantees one supervised instance per
         # slot, so there is no legitimate sibling for ``--replace`` to clobber.
+        # Already environment-initialized here: bypass the docker-exec shim,
+        # whose second HOME reset would discard an explicit extra_env override.
         if profile == "default":
-            gateway_cmd = "hermes gateway run --replace"
+            gateway_cmd = "/opt/hermes/.venv/bin/hermes gateway run --replace"
         else:
-            gateway_cmd = f"hermes -p {shlex.quote(profile)} gateway run --replace"
+            gateway_cmd = f"/opt/hermes/.venv/bin/hermes -p {shlex.quote(profile)} gateway run --replace"
         # Skip the drop when already non-root (setgroups() lacks CAP_SETGID → s6 boot-loop).
-        lines.append(f'[ "$(id -u)" = 0 ] || exec {gateway_cmd}')
-        lines.append(f"exec s6-setuidgid hermes {gateway_cmd}")
+        lines.append(f'[ "$(/usr/bin/id -u)" = 0 ] || exec {gateway_cmd}')
+        lines.append(f'exec /command/s6-setuidgid hermes /usr/bin/env "PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:$HERMES_HOME/.local/bin:$PATH" {gateway_cmd}')
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -488,7 +495,7 @@ class S6ServiceManager:
         from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
         code = GATEWAY_FATAL_CONFIG_EXIT_CODE
         return (
-            "#!/command/with-contenv sh\n"
+            "#!/command/with-contenv /bin/sh\n"
             "# shellcheck shell=sh\n"
             "# $1 = exit code from the run script.\n"
             f"# Exit {code} (EX_CONFIG) = fatal config error — don't restart.\n"
@@ -509,25 +516,25 @@ class S6ServiceManager:
         ``1`` and the log dir rather than before ``1``."""
         prof = shlex.quote(profile)
         return (
-            f"#!/command/with-contenv sh\n"
+            f"#!/command/with-contenv /bin/sh\n"
             f"# shellcheck shell=sh\n"
-            f': "${{HERMES_HOME:=/opt/data}}"\n'
+            '. /opt/hermes/docker/runtime-env.sh\n'
             f'log_dir="$HERMES_HOME/logs/gateways/{prof}"\n'
             # Create the leaf and clear a stale s6-log lock AS HERMES when starting as root. Never
             # chown/unlink hermes-writable volume paths from this restartable root-context script:
             # an unprivileged user can race a pathname op through a symlink swap (CWE-59/CWE-367).
             # Parent logs/gateways is seeded hermes-owned at stage2 boot (test_log_dir_seed.py).
             # See #45258.
-            f'if [ "$(id -u)" = 0 ]; then\n'
-            f'  s6-setuidgid hermes mkdir -p "$log_dir"\n'
-            f'  s6-setuidgid hermes rm -f "$log_dir/lock"\n'
+            f'if [ "$(/usr/bin/id -u)" = 0 ]; then\n'
+            f'  /command/s6-setuidgid hermes /bin/mkdir -p "$log_dir"\n'
+            f'  /command/s6-setuidgid hermes /bin/rm -f "$log_dir/lock"\n'
             f'else\n'
             f'  mkdir -p "$log_dir"\n'
             f'  rm -f "$log_dir/lock"\n'
             f'fi\n'
             # Skip the drop when already non-root (CAP_SETGID).
-            f'[ "$(id -u)" = 0 ] || exec s6-log 1 n10 s1000000 T "$log_dir"\n'
-            f'exec s6-setuidgid hermes s6-log 1 n10 s1000000 T "$log_dir"\n'
+            f'[ "$(/usr/bin/id -u)" = 0 ] || exec /command/s6-log 1 n10 s1000000 T "$log_dir"\n'
+            f'exec /command/s6-setuidgid hermes /command/s6-log 1 n10 s1000000 T "$log_dir"\n'
         )
 
     # -- lifecycle ---------------------------------------------------------
