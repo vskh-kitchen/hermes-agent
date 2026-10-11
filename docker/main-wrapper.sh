@@ -62,19 +62,23 @@ fi
 # to the hermes user's home before dropping privileges so libraries that
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
 # don't try to write to /root.
-export HOME=/opt/data
+. /opt/hermes/docker/runtime-env.sh
+export HOME="$HERMES_HOME"
 
 # Save the Docker -w (or default) working directory before init
 # scripts cd to /opt/data, so the container starts in the
 # directory the user requested.
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
-cd /opt/data
+cd "$HERMES_HOME"
 
 # Restore the original working directory before handing off to
 # the user's command so `hermes chat` starts in the Docker -w
 # directory, not /opt/data.
 cd "$_hermes_orig_cwd"
+
+# Keep bootstrap command resolution unchanged; user tools follow image commands.
+export PATH="$PATH:$HERMES_HOME/.local/bin"
 
 if [ $# -eq 0 ]; then
     drop hermes

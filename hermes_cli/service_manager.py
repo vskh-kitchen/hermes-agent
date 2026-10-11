@@ -444,11 +444,13 @@ class S6ServiceManager:
             "#!/command/with-contenv sh",
             "# shellcheck shell=sh",
             "set -e",
-            "export HOME=/opt/data",
-            "cd /opt/data",
         ]
         for k, v in sorted(extra_env.items()):
             lines.append(f"export {k}={shlex.quote(v)}")
+        lines.append(". /opt/hermes/docker/runtime-env.sh")
+        if "HOME" not in extra_env:
+            lines.append('export HOME="$HERMES_HOME"')
+        lines.append('cd "$HERMES_HOME"')
         # Supervised-child sentinel: without it the supervised gateway re-entering
         # `_gateway_command_inner` with subcmd == "run" would dispatch `gateway start` → re-exec
         # `gateway run --replace` → `gateway start` … (see the matching guard there).
