@@ -381,6 +381,49 @@ Direct `-e` flags override values from `.env`. This is useful for CI/CD or secre
 This page covers running Hermes itself inside Docker. If you want Hermes to execute the agent's `terminal` / `execute_code` calls inside a Docker sandbox container (one long-lived container shared across Hermes processes — see issue #20561), that's a separate config block — `terminal.backend: docker` plus `terminal.docker_image`, `terminal.docker_volumes`, `terminal.docker_forward_env`, `terminal.docker_env`, `terminal.docker_run_as_host_user`, `terminal.docker_extra_args`, `terminal.docker_persist_across_processes`, and `terminal.docker_orphan_reaper`. See [Configuration → Docker Backend](configuration.md#docker-backend) for the full set including container-lifecycle rules.
 :::
 
+## Automatic sandbox binds from a containerized gateway
+
+With the Docker terminal backend and a host Docker socket, sandboxes are siblings
+of the gateway. Bind sources belong to the **daemon host**, not the gateway's
+filesystem. Hermes translates automatic cache, skills, credential, persistent
+home/workspace, configured cwd, and proxy CA binds through the creator container's
+`docker inspect` mount table. Only the source changes; local validation and media
+path mapping retain gateway paths. Explicit `docker_volumes` and
+`docker_extra_args` remain operator-supplied daemon paths.
+
+Discovery uses a full container ID from Linux hostname mount metadata (or a v1
+cgroup), not `HOSTNAME`, which can be customized. Mountinfo octal escapes are
+decoded; its hostname root is filesystem-relative, **not** an absolute host
+path. Inspect must return the same ID and consistent hostname metadata. A
+read-only `docker exec` using the gateway's Python interpreter then corroborates
+the kernel boot UUID and `/etc/hostname` device/inode against the gateway. This
+works with a separately mounted Docker data filesystem without guessing its
+host mount point or treating matching path suffixes as identity proof. The
+longest covering bind mount wins.
+Read-only leaf mounts stay read-only; the full Hermes home is never exposed just
+to share a credential file. Writable automatic binds cannot bypass a read-only
+gateway mount. Mount topology participates in the sandbox reuse fingerprint.
+
+Container-layer files, named volumes, tmpfs, and directories containing nested
+gateway mounts cannot be safely represented by a single host bind and are
+rejected after successful discovery. Put required sources on gateway bind mounts;
+for sanitized skills copies, `TMPDIR` must also be on a bind mount. No data is
+copied into a wider mount and named-volume storage internals are not guessed.
+
+When the creator cannot be identified or inspected (including a remote daemon
+that does not own it), or the corroborating exec/interpreter/kernel metadata is
+unavailable, Hermes preserves legacy source paths; discovery failures produce a
+warning. This fallback does **not** establish shared filesystem access or fix
+remote-daemon mounts, so the original empty-mount problem can remain. Identity
+corroboration assumes a trusted daemon and kernel: it rejects accidental remote
+ID/path/inode matches, not malicious metadata, spoofed/cloned boot UUIDs, or
+containers deliberately sharing the same hostname inode. Mount-table changes
+after discovery are not locked out. Native Linux/macOS/Windows launches remain
+unchanged.
+Docker-compatible runtimes must expose matching identity and mount metadata for
+automatic translation. Recreate affected sandboxes to change immutable binds;
+restarting an existing sandbox does not change its mount sources.
+
 ## Docker Compose example
 
 For persistent deployment with both the gateway and dashboard, a `docker-compose.yaml` is convenient:

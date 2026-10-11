@@ -37,7 +37,16 @@ from tools.environments.path_utils import sanitize_task_id_for_path
 from tools.environments.remote_common import (
     bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
 
+from tools.environments.docker_bind_paths import BindPathError, discover_bind_sources
+
 logger = logging.getLogger(__name__)
+_gateway_mountinfo_path = "/proc/self/mountinfo"
+_gateway_cgroup_path = "/proc/self/cgroup"
+
+
+def _automatic_bind_sources():
+    return discover_bind_sources(run_capture, find_docker() or "docker",
+                                 _gateway_mountinfo_path, _gateway_cgroup_path)
 
 # Docker Desktop install paths checked when 'docker' is not in PATH
 # (macOS Intel / Apple Silicon Homebrew / app bundle).
@@ -152,7 +161,8 @@ def _is_volatile_mount_spec(spec: str) -> bool:
         return False
 
 
-def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_home: str) -> str:
+def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_home: str,
+                                   bind_namespace: str = "") -> str:
     """Hash immutable configuration so reuse cannot silently attach to stale mounts.
 
     Hash requested values rather than exposing profile paths and volume sources in labels.
@@ -169,7 +179,8 @@ def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_
          if _is_volatile_mount_spec(spec) else spec)
         for spec in mount_args]
     payload = json.dumps(
-        {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home},
+        {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home,
+         **({"bind_namespace": bind_namespace} if bind_namespace else {})},
         sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
@@ -528,12 +539,13 @@ _RO_MOUNT_SOURCES = (
     ("get_cache_directory_mounts", False, "cache dir"))
 
 
-def _readonly_skill_mount_args() -> list[str]:
+def _readonly_skill_mount_args(bind_sources=None) -> list[str]:
     """``-v host:container:ro`` args for credential files, skill dirs and cache dirs. Read-only so the
     container can authenticate/read but never modify host state. Missing or wrong-kind sources are
     skipped with a warning (Docker-in-Docker auto-creates a missing file source as a directory,
     which would exit 125)."""
     args: list[str] = []
+    bind_sources = bind_sources or _automatic_bind_sources()
     try:
         import tools.credential_files as cf
         for getter, expects_file, noun in _RO_MOUNT_SOURCES:
@@ -547,8 +559,11 @@ def _readonly_skill_mount_args() -> list[str]:
                 if problem:
                     logger.warning("Docker: skipping %s mount — %s: %s", noun.split()[0], problem, src)
                     continue
-                args.extend(["-v", f"{entry['host_path']}:{entry['container_path']}:ro"])
+                daemon_source = bind_sources.source(entry["host_path"], readonly=True)
+                args.extend(["-v", f"{daemon_source}:{entry['container_path']}:ro"])
                 logger.info("Docker: mounting %s %s -> %s", noun, entry["host_path"], entry["container_path"])
+    except BindPathError:
+        raise
     except Exception as e:
         logger.debug("Docker: could not load credential file mounts: %s", e)
     return args
@@ -678,6 +693,7 @@ class DockerEnvironment(BaseEnvironment):
 
         _ensure_docker_available()
 
+        self._bind_sources = _automatic_bind_sources()
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
         mount = getattr(self, "host_cwd_mount", None)
@@ -687,7 +703,7 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
-        volume_args.extend(_readonly_skill_mount_args())
+        volume_args.extend(_readonly_skill_mount_args(self._bind_sources))
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -738,7 +754,7 @@ class DockerEnvironment(BaseEnvironment):
         if not shared_container_key:
             self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
                 image=image, mount_args=[*writable_args, *volume_args],
-                hermes_home=str(get_hermes_home()))
+                hermes_home=str(get_hermes_home()), bind_namespace=self._bind_sources.fingerprint())
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_pinned = image_pinned
@@ -763,6 +779,12 @@ class DockerEnvironment(BaseEnvironment):
         validated_extra)``; sets ``self._run_env_values`` (injected into the docker-client
         subprocess env at run time and reused verbatim by container-recreation recovery)."""
         egress_volume_args, egress_env_overrides, egress_host_args = _egress_proxy_args_for_docker()
+        bind_sources = getattr(self, "_bind_sources", None)
+        if bind_sources is not None:
+            # These are generated CA binds, not operator-supplied volume specs.
+            egress_volume_args = [
+                f"{bind_sources.source(arg.rsplit(':', 2)[0], readonly=True)}:{arg.rsplit(':', 2)[1]}:ro"
+                if arg != "-v" else arg for arg in egress_volume_args]
         egress_label = _egress_reuse_fingerprint(egress_volume_args, egress_env_overrides, egress_host_args)
         enforce_egress = _egress_enforce_on_docker() if egress_env_overrides else True
         critical_egress_names = _critical_egress_env_names(egress_env_overrides)
@@ -830,6 +852,7 @@ class DockerEnvironment(BaseEnvironment):
         the host — it can never be a path inside the Linux container, and the check
         is the drive shape, not a username.
         """
+        bind_sources = getattr(self, "_bind_sources", None) or _automatic_bind_sources()
         volume_args: list[str] = []
         for vol in (volumes or []):
             if not isinstance(vol, str):
@@ -851,7 +874,8 @@ class DockerEnvironment(BaseEnvironment):
         if (auto_mount_cwd or windows_cwd) and host_cwd and not host_dir_exists:
             logger.debug("Skipping docker cwd mount: host_cwd is not a valid directory: %s", host_cwd)
 
-        existing_mount = _existing_host_mount(volume_args, host_cwd_abs) if should_bind else None
+        daemon_cwd = bind_sources.source(host_cwd_abs, readonly=True) if should_bind else ""
+        existing_mount = _existing_host_mount(volume_args, daemon_cwd) if should_bind else None
         if existing_mount:
             # Already bind-mounted (often the volume that claimed /workspace). Point
             # tools at that container path instead of adding a second -v.
@@ -880,18 +904,19 @@ class DockerEnvironment(BaseEnvironment):
             sandbox = get_sandbox_dir() / "docker" / _sandbox_dir_name(task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
-            writable_args += ["-v", f"{self._home_dir}:/root"]
+            writable_args += ["-v", f"{bind_sources.source(self._home_dir)}:/root"]
             if mount_workspace:
                 self._workspace_dir = str(sandbox / "workspace")
                 os.makedirs(self._workspace_dir, exist_ok=True)
-                writable_args += ["-v", f"{self._workspace_dir}:/workspace"]
+                writable_args += ["-v", f"{bind_sources.source(self._workspace_dir)}:/workspace"]
         else:
             writable_args += ["--tmpfs", "/workspace:rw,exec,size=10g"] if mount_workspace else []
             writable_args += ["--tmpfs", "/home:rw,exec,size=1g", "--tmpfs", "/root:rw,exec,size=1g"]
 
         if bind_target:
+            daemon_cwd = bind_sources.source(host_cwd_abs)
             logger.info("Mounting configured host cwd to %s: %s", bind_target, host_cwd_abs)
-            volume_args = ["-v", f"{host_cwd_abs}:{bind_target}", *volume_args]
+            volume_args = ["-v", f"{daemon_cwd}:{bind_target}", *volume_args]
         elif workspace_explicitly_mounted and not existing_mount:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
         return volume_args, writable_args
