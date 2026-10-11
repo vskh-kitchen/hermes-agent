@@ -24,11 +24,11 @@ if [ -z "${HERMES_MAIN_WRAPPER_ENV_READY:-}" ] && \
    [ -z "${HERMES_HOME:-}" ] && \
    [ -x /command/with-contenv ]; then
     export HERMES_MAIN_WRAPPER_ENV_READY=1
-    exec /command/with-contenv /bin/sh "$0" "$@"
+    exec /command/with-contenv sh "$0" "$@"
 fi
 unset HERMES_MAIN_WRAPPER_ENV_READY
 
-drop() { [ "$(/usr/bin/id -u)" = 0 ] && set -- /command/s6-setuidgid hermes /usr/bin/env "PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:$HERMES_HOME/.local/bin:$PATH" "$@"; exec "$@"; }
+drop() { [ "$(id -u)" = 0 ] && set -- s6-setuidgid hermes "$@"; exec "$@"; }
 
 # --- Reject the unsupported `docker run --user <uid>:<gid>` start ---
 # Mirror the guard in stage2-hook.sh (cont-init). This is the surface the
@@ -37,8 +37,8 @@ drop() { [ "$(/usr/bin/id -u)" = 0 ] && set -- /command/s6-setuidgid hermes /usr
 # baked image dirs (owned by the hermes build UID) are unwritable, so fail
 # fast here with actionable guidance rather than crashing on `cd`/EACCES
 # further down. See stage2-hook.sh for the full rationale.
-cur_uid="$(/usr/bin/id -u)"
-if [ "$cur_uid" != 0 ] && [ "$cur_uid" != "$(/usr/bin/id -u hermes)" ]; then
+cur_uid="$(id -u)"
+if [ "$cur_uid" != 0 ] && [ "$cur_uid" != "$(id -u hermes)" ]; then
     cat >&2 <<EOF
 [hermes] ERROR: container started with --user $cur_uid (an arbitrary, non-hermes UID) — not supported.
 
@@ -63,9 +63,10 @@ fi
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
 # don't try to write to /root.
 . /opt/hermes/docker/runtime-env.sh
+export HOME="$HERMES_HOME"
 
 # Save the Docker -w (or default) working directory before init
-# scripts cd to $HERMES_HOME, so the container starts in the
+# scripts cd to /opt/data, so the container starts in the
 # directory the user requested.
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
@@ -73,14 +74,11 @@ cd "$HERMES_HOME"
 
 # Restore the original working directory before handing off to
 # the user's command so `hermes chat` starts in the Docker -w
-# directory, not $HERMES_HOME.
+# directory, not /opt/data.
 cd "$_hermes_orig_cwd"
 
-# Resolve user command routing only after dropping, including commands installed
-# solely in HERMES_HOME/.local/bin. The re-entry uses image-owned shell/script.
-if [ "$(/usr/bin/id -u)" = 0 ]; then
-    drop /bin/sh /opt/hermes/docker/main-wrapper.sh "$@"
-fi
+# Keep bootstrap command resolution unchanged; user tools follow image commands.
+export PATH="$PATH:$HERMES_HOME/.local/bin"
 
 if [ $# -eq 0 ]; then
     drop hermes

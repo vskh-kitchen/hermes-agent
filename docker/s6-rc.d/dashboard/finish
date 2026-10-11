@@ -1,4 +1,4 @@
-#!/command/with-contenv /bin/sh
+#!/command/with-contenv sh
 # shellcheck shell=sh
 # Dashboard finish script. Companion to ./run.
 #

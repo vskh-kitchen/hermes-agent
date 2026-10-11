@@ -1,4 +1,4 @@
-#!/command/with-contenv /bin/sh
+#!/command/with-contenv sh
 # shellcheck shell=sh
 # Container-boot reconciliation of per-profile gateway s6 services.
 #
@@ -24,8 +24,6 @@
 # and swallows the failure).
 set -e
 
-. /opt/hermes/docker/runtime-env.sh
-
 # Make the dynamic scandir hermes-writable. The directory itself
 # starts root-owned by s6-overlay.
 chown hermes:hermes /run/service 2>/dev/null || true
@@ -44,6 +42,8 @@ if [ -d /run/service/.s6-svscan ]; then
     done
 fi
 
+. /opt/hermes/docker/runtime-env.sh
+
 # Skip the drop when already non-root.
-[ "$(/usr/bin/id -u)" = 0 ] || exec /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
-exec /command/s6-setuidgid hermes /usr/bin/env "PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:$HERMES_HOME/.local/bin:$PATH" /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+[ "$(id -u)" = 0 ] || exec /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+exec s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot

@@ -21,7 +21,7 @@ set -eu
 INSTALL_DIR="/opt/hermes"
 
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
-as_hermes() { [ "$(/usr/bin/id -u)" = 0 ] || { "$@"; return; }; /command/s6-setuidgid hermes /usr/bin/env "PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:$HERMES_HOME/.local/bin:$PATH" "$@"; }
+as_hermes() { [ "$(id -u)" = 0 ] || { "$@"; return; }; s6-setuidgid hermes "$@"; }
 
 # --- Reject the unsupported `docker run --user <uid>:<gid>` start ---
 # Detect the case where the container was launched with `--user` pinned to an
@@ -641,7 +641,7 @@ fi
 # after first-boot seeding and before supervised gateway services start.
 # Set HERMES_SKIP_CONFIG_MIGRATION=1 for controlled/manual migrations.
 if [ -f "$HERMES_HOME/config.yaml" ]; then
-    as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
+    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
         || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
 fi
 
@@ -654,7 +654,7 @@ fi
 # keeps the extras recorded for the next boot or install. Then collect the
 # generations nothing selects any more: no service holds a lease yet, and
 # collect_generations keeps anything younger than a day.
-as_hermes "$INSTALL_DIR/.venv/bin/python" -c '
+s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" -c '
 from pathlib import Path
 from hermes_cli.runtime_state import collect_generations
 from pm.environments import install_state_dir
@@ -698,7 +698,7 @@ if [ -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_REBOOTSTRAP:-}" ]
     if refuse_symlinked_path "reseed" "$HERMES_HOME/auth.json"; then
         :
     else
-        as_hermes "$INSTALL_DIR/.venv/bin/python" \
+        s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" \
             "$INSTALL_DIR/scripts/docker_rebootstrap_nous_session.py" \
             "$HERMES_HOME/auth.json" \
             || echo "[stage2] Warning: docker_rebootstrap_nous_session.py failed; continuing"
